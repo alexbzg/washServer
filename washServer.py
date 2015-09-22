@@ -37,32 +37,33 @@ def jsonEncodeExtra( obj ):
 conf = siteConf()
 
 class Car:
-    reLP = re.compile( r'/^(.{5,}\D)(\d+)$/' )
+    reLP = re.compile( '^(.{5,}\D)(\d+)$', re.U )
 
     @classmethod
     def fromQuery( cls, query ):
-        queryMatch = reLP.match( query )
-        ln, region
+        queryMatch = Car.reLP.match( query )
+        ln, region = '', ''
         if queryMatch:
-            ln = queryMatch( 1 )
-            region = queryMatch( 2 )
+            ln = queryMatch.group( 1 )
+            region = queryMatch.group( 2 )
         else:
             ln = query
             region = None
         return cls( { 'license_no': ln, 'region': region } )
 
     def __init__( self, params ):
-        dbData = db.getObject( 'cars', params, create = True )
+        dbData = db.getObject( 'cars', params )
         self.id = dbData[ 'id' ]
         self.licenseNo = dbData[ 'license_no' ]
         self.region = dbData[ 'region' ]
         self.balance = 0
         self.notpayed = None
-
+        self.prev = 0
+       
         if dbData[ 'client_id' ]:
-            self.client = db.getObject( 'clients', 
-                    { 'id': dbData[ 'client_id' ] } )
+            self.client = getWashClient( dbData[ 'client_id' ] )
         else:
+            self.client = None
             balance_sql = "select sum( pay_sum ) - sum( total ) \
                     as balance,\
                     sum( 1 ) as  count \
@@ -75,56 +76,87 @@ class Car:
             if balance:
                 self.balance = balance
             if self.balance < -50:
-            notpayed_sql = """
-                select id, total,
-                to_char( tstamp_start, 'DD.MM.YYYY HH24:MI' ) 
-                as tstamp_start
-                from operations where car_id = %s 
-                and total - pay_sum > 50 and not service_mode 
-                and pay is not null;
+                notpayed_sql = """
+                    select id, total,
+                    to_char( tstamp_start, 'DD.MM.YYYY HH24:MI' ) 
+                    as start
+                    from operations where car_id = %s 
+                    and total - pay_sum > 50 and not service_mode 
+                    and pay is not null;
                 """
-            self.notpayed = cursor2dicts( 
-                    db.execute( sql, ( carId, ) ),
+                self.notpayed = cursor2dicts( 
+                    db.execute( notpayed_sql, ( self.id, ) ),
                     True )
-            if not slef.notpayed:
-                notpayed = None
-        else:
-            self.notpayed = None
+                if not self.notpayed:
+                    notpayed = None
+            else:
+                self.notpayed = None
 
     def toDict( self ):
         return { 'id': self.id,
                 'licenseNo': self.licenseNo,
                 'region': self.region,
                 'balance': self.balance,
-                'notpayed': self.notpayed }
+                'notpayed': self.notpayed,
+                'client': self.client }
    
 
        
 
 class PbConnection( pb.Referenceable ):
     def remote_data( self, data ):
+
         d = json.loads( data )
+
         if d.has_key( 'signal' ):
             if d[ 'signal'][ 'type' ] == 'stop':
                 devices[ d[ 'signal'][ 'device' ] 
                         ].stopping = True
             devices[ d[ 'signal'][ 'device' ] ].signal( \
                     d[ 'signal'][ 'type' ] )
+
         elif d.has_key( 'carQuery' ):
-            self.update( 
-                { 'cars': \
-                    { Car.fromQuery( d[ 'carQuery' ] ).toDict() }, 
+            self.update( { 'cars': \
+                    Car.fromQuery( d[ 'carQuery' ] ).toDict(), 
                     'create': 1 } )
+
         elif d.has_key( 'setCarData' ):
-            if d[ 'setCarData' ].has_key( 'car' ):
-                operations[ d[ 'setCarData' ][ 'operation' ] ].setCar( \
-                    d[ 'setCarData' ][ 'car' ] )
-            elif d[ 'setCarData' ].has_key( 'serviceMode' ):
-                operations[ d[ 'setCarData' ][ 'operation' ] \
-                        ].setServiceMode()
-            elif d[ 'setCarData' ].has_key( 'noLP' ):
-                operations[ d[ 'setCarData' ][ 'operation' ] \
-                        ].setNoLP()
+            cd = d[ 'setCarData' ]
+            opr = operations[ cd[ 'operation' ] ]
+            if cd[ 'car' ]:
+                opr.setCar( Car( cd[ 'car' ] ) )
+            elif cd[ 'serviceMode' ]:
+                opr.setServiceMode()
+            elif cd[ 'noLP' ]:
+                opr.setNoLP()
+            if cd[ 'client' ]:
+                opr.setClient( cd[ 'client' ][ 'id' ] )
+
+        elif d.has_key( 'closeOperation' ):
+            op = operations[ d['closeOperation']['id'] ]
+            total = op.getTotal()
+            op.close( total, 
+                total if d['closeOperation']['pay'] else 0 )
+            if ( d['closeOperation']['pay'] and op.car and \
+                    op.car.notpayed ):
+                for np in op.car.notpayed.values():
+                    db.updateObject( 'operations',
+                        { 'id': np['id'], 'pay_sum': np['total'] } )
+        elif d.has_key( 'getLPHints' ):
+            self.sendLPHints( d[ 'getLPHints' ][ 'pattern' ] )
+
+
+    def sendLPHints( self, pattern ):
+        sql = """select license_no || region as lp from cars 
+                    where license_no ~ %s 
+                    order by 
+                        ( select sum(1) from operations 
+                        where car_id = cars.id and 
+                        pay > now() - interval '2 months' )
+                    limit 3"""
+        hints = cursor2dicts( db.execute( sql, (pattern, ) ) )
+        self.update( { 'lpHints' : \
+            cursor2dicts( db.execute( sql, (pattern, ) ) ) } )
 
 
     def update( self, params ):
@@ -150,9 +182,18 @@ class PbServer( pb.Root ):
         pbc.locationId = locationId
         pbc.count = 0
         clientConnections[ locationId ] = pbc
-        pbc.update( { 'devices': dict( ( id, devices[ id ].toDict() ) 
-            for id in devices.keys() 
-            if devices[ id ].locationId == locationId ),
+        pbc.update( 
+            { 'devices': 
+                dict( ( id, devices[ id ].toDict() ) 
+                for id in devices.keys() 
+                if devices[ id ].locationId == locationId ),
+            'operations': 
+                dict( ( id, operations[ id ].toDict() ) 
+                for id in operations.keys()
+                if operations[ id ].locationId == locationId ),
+            'clientButtons':
+                clientButtons[ locationId ] \
+                if clientButtons.has_key( locationId ) else None,
             'create': True } )
         return pbc
 
@@ -208,6 +249,10 @@ class Device:
             if service.default:
                 service.signal( type )
 
+    def controllerConnectionChanged( self, val ):
+        self.updateClient( controllersConnection = \
+                self.controllersConnection )
+
     def setPresence( self, val ):
         if self.detectsPresence and self.presence != val:
             self.presence = val
@@ -260,6 +305,7 @@ class Device:
         return { 'id': self.id, 'name': self.name,
                 'detectsPresence': self.detectsPresence,
                 'active': self.active,
+                'controllersConnection': self.controllersConnection,
                 'services': dict( ( id, self.services[ id ].toDict() )
                     for id in self.services.keys() ) }
 
@@ -270,6 +316,7 @@ class Device:
         self.pause = False
         self.active = False
         self.operation = None
+        self.controllers = []
         self.type = params[ 'type_id' ]
         self.name = params[ 'name' ]
         self.tariff = params[ 'tariff' ]
@@ -278,54 +325,76 @@ class Device:
         self.presence = False
         self.events = []
         self.presenceTimer = None
-        self.services = dict( zip( servicesParams.keys(), 
-            [ Service( serviceParams, self ) for serviceParams in 
-                servicesParams.values() ] ) )
-        controllersDom = etree.fromstring( params['controllers_xml'] )
-        for controllerNode in \
-            controllersDom.xpath( '/controllers/controller' ):
-            name = controllerNode.get( 'name' )
-            if name in controllers:
-                controller = controllers[ name ]
-            else:
-                controller = Controller( name )
-            templateDom = etree.fromstring( db.getValue( '''
-                select template from device_control_templates
-                where name = %s''', 
-                ( controllerNode.get( 'template' ), ) ) )
-            for controlNode in templateDom.xpath( 
-                    'control[ @action = "presence" ]' ):
-                line = int( controlNode.get( 'no' ) )
-                controller.setCallback( line, 
-                        self.setPresence )
-                controller.setLineMode( line, 'in' )
-            for eventNode in templateDom.xpath( 'event' ):
-                self.events.append( 
-                        self.Event( controller, eventNode ) )
-            for serviceNode in templateDom.xpath( 'service' ):
-                service = self.services[ int( serviceNode.get( 'id' ) ) ]
-                for controlNode in serviceNode.xpath( 
-                    'control[ @mode = "pulse" or @signal = "yes" ]' ):
+        if servicesParams:
+            self.services = dict( zip( servicesParams.keys(), 
+                [ Service( serviceParams, self ) for serviceParams in 
+                    servicesParams.values() ] ) )
+        else: 
+            self.services = {}
+        if params.has_key('controllers_xml') and \
+            params['controllers_xml']:
+            controllersDom = \
+                    etree.fromstring( params['controllers_xml'] )
+            for controllerNode in \
+                controllersDom.xpath( '/controllers/controller' ):
+                name = controllerNode.get( 'name' )
+                if name in controllers:
+                    controller = controllers[ name ]
+                else:
+                    controller = Controller( name )
+                controller.devices.append( self )
+                if controller not in self.controllers:
+                    self.controllers.append( controller )
+                templateDom = etree.fromstring( db.getValue( '''
+                    select template from device_control_templates
+                    where name = %s''', 
+                    ( controllerNode.get( 'template' ), ) ) )
+                for controlNode in templateDom.xpath( 
+                        'control[ @action = "presence" ]' ):
                     line = int( controlNode.get( 'no' ) )
-                    service.outLines[ controlNode.get( 'action' ) 
-                            ].append( {'controller': controller,
-                            'line': line } )
-                    controller.setLineMode( line, 
-                            controlNode.get( 'mode' ) )
-
-                for controlNode in serviceNode.xpath(
-                        'control[ @action = "status" ]' ):
-                    line = int( controlNode.get( 'no' ) )
-                    service.statusLines.append(
-                            { 'controller': controller,
-                                'line': line,
-                                'negative': 
-                                    ( controlNode.get( 'negative' ) 
-                                        == '1' ) } )
                     controller.setCallback( line, 
-                            service.checkStatusLines )
-                    controller.setLineMode( line, 
-                            controlNode.get( 'mode' ) )
+                            self.setPresence )
+                    controller.setLineMode( line, 'in' )
+                for eventNode in templateDom.xpath( 'event' ):
+                    self.events.append( 
+                            self.Event( controller, eventNode ) )
+                for serviceNode in templateDom.xpath( 'service' ):
+                    service = self.services[ 
+                            int( serviceNode.get( 'id' ) ) ]
+                    for controlNode in serviceNode.xpath( 
+                        'control[ @mode = "pulse" or @signal = "yes" ]' ):
+                        line = int( controlNode.get( 'no' ) )
+                        service.outLines[ controlNode.get( 'action' ) 
+                                ].append( {'controller': controller,
+                                'line': line } )
+                        controller.setLineMode( line, 
+                                controlNode.get( 'mode' ) )
+
+                    for controlNode in serviceNode.xpath(
+                            'control[ @action = "status" ]' ):
+                        line = int( controlNode.get( 'no' ) )
+                        service.statusLines.append(
+                                { 'controller': controller,
+                                    'line': line,
+                                    'negative': 
+                                        ( controlNode.get( 'negative' ) 
+                                            == '1' ) } )
+                        controller.setCallback( line, 
+                                service.checkStatusLines )
+                        controller.setLineMode( line, 
+                                controlNode.get( 'mode' ) )
+
+
+
+    @property
+    def controllersConnection( self ):
+        if [ c for c in self.controllers if not c.connected ]:
+            if [ c for c in self.controllers if c.connected ]:
+                return None
+            else:
+                return False
+        else:
+            return True
 
 
 class Service:
@@ -339,6 +408,13 @@ class Service:
         self.tarification = params[ 'tarification' ]
         self.outLines = { 'start': [], 'stop': [], 'status': [] }
         self.statusLines = []
+
+    def controllersConnected( self ):
+        if [ l for l in self.statusLines \
+                if not l[ 'controller' ].connected ]:
+            return False
+        else:
+            return True
 
     def toDict( self ):
         return { 'id': self.id, 'name': self.name, 
@@ -364,7 +440,8 @@ class Service:
     def start( self ):
         if not self.active:
             self.active = True
-            print self.device.name + " " + self.name + " start"
+            print ( self.device.name + " " + self.name + " start" \
+                    )
             if self.default:
                 if self.device.pause:
                     self.device.pause = False
@@ -378,7 +455,8 @@ class Service:
     def stop( self ):
         if self.active:
             self.active = False
-            print self.device.name + " " + self.name + " stop"
+            print ( self.device.name + " " + self.name + " stop" \
+                    )
             if self.default:
                 if self.device.stopping:
                     self.device.stop()
@@ -387,7 +465,9 @@ class Service:
             self.updateClient( active = False )
 
     def charge( self ):
-        if self.active and self.device.active and not self.device.pause:
+        if self.active and self.device.active \
+                and not self.device.pause \
+                and self.controllersConnected():
             if not self.device.operation:
                 Operation( self.device )
             if not self.operationDetail:
@@ -407,19 +487,30 @@ class Operation:
         self.car = None
         self.noLP = False
         self.serviceMode = False
+        self.client = None
+        self.device = None
         if id:
             dbData = db.getObject( 'operations', { 'id': id } )
             self.id = id
             self.tstamp_start = dbData[ 'tstamp_start' ]
             self.tstamp_stop = dbData[ 'tstamp_end' ]
             self.locationId = dbData[ 'location_id' ]
+            if dbData[ 'device_id' ]:
+                self.device = devices[ dbData[ 'device_id' ] ]
             if dbData[ 'current_device_id' ] and \
                 devices[ dbData[ 'current_device_id' ] ].active:
                 self.device = devices[ dbData[ 'current_device_id' ] ]
                 self.device.operation = self
             else:
-                self.device = None
                 self.stop()
+            if dbData['car_id']:
+                self.setCar( Car( { 'id': dbData['car_id'] } ) )
+            if dbData[ 'no_lp' ]:
+                self.setNoLP()
+            if dbData[ 'service_mode' ]:
+                self.setServiceMode()
+            if dbData[ 'client_id' ]:
+                self.client = getWashClient( dbData[ 'client_id' ] )
             detailData = cursor2dicts( db.execute ( '''
                 select * from operation_detail where operation_id = 
                 ''' + str( id ) ), True )
@@ -445,6 +536,14 @@ class Operation:
         updateClient( self.locationId,
                 { 'operations': { self.id: self.toDict() },
                     'create': True } )
+        
+
+    def getTotal( self ):
+        r = 0
+        for deviceId in self.details.keys():
+            for serviceId in self.details[ deviceId ].keys():
+                r += self.details[ deviceId ][ serviceId ].total
+        return r
 
     def toDict( self ):
         return { 'id': self.id,
@@ -454,6 +553,7 @@ class Operation:
                 'noLP': self.noLP,
                 'serviceMode': self.serviceMode,
                 'car': self.car.toDict() if self.car else None,
+                'client': self.client,
                 'details': 
                     dict( ( deviceId, dict( ( serviceId,
                         self.details[ deviceId 
@@ -484,15 +584,15 @@ class Operation:
         self.updateClient( closed = True )
 
     def setCar( self, car ):
-        self.serviceMode = False
-        self.noLP = False
         self.car = car
+        if car != None:
+            self.serviceMode = False
+            self.noLP = False
+            if ( car.balance < -50 ) and self.device and \
+                    self.device.operation == self:
+                self.device.stopping = True
+                self.device.signal( 'stop' )
         self.updateCarData()
-        if ( car.getBalance() < -50 ) and self.device:
-            self.device.signal( 'stop' )
-        self.updateClient( carId = car.id, 
-                license_no = car.license_no,
-                region = car.region, balance = car.balance )
 
     def setNoLP( self ):
         self.noLP = True
@@ -506,8 +606,18 @@ class Operation:
         self.car = None
         self.updateCarData()
 
+    def setClient( self, id ):
+        if id:
+            self.client = getWashClient( id )
+            self.serviceMode = False
+            self.noLP = False
+        else:
+            self.client = None
+        self.updateCarData()
+
     def updateCarData( self ):
         self.update( car_id = self.car.id if self.car else None,
+                client_id = self.client['id'] if self.client else None,
                 service_mode = self.serviceMode,
                 no_lp = self.noLP )
 
@@ -519,13 +629,12 @@ class OperationDetail:
         if not self.operation.details.has_key( service.device.id ):
             self.operation.details[ service.device.id ] = {}
         self.operation.details[ service.device.id ][ service.id ] = self
-        if operation.device == service.device:
+        if service.device.operation == operation:
             service.operationDetail = self
         dbdata = db.getObject( 'operation_detail', 
                 { 'device_id': service.device.id,
                     'service_id': service.id,
-                    'operation_id': self.operation.id },
-                True )
+                    'operation_id': self.operation.id } )
         self.id = dbdata[ 'id' ]
         self.qty = 0
         self.total = 0
@@ -601,6 +710,9 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
             self.pingTimer = None;
         self.pingTimer = reactor.callLater( self.pingInterval,
                 lambda: self.ping() )
+        if data.startswith( 'SLINF' ) or data.startswith( 'FLAGS' ) or \
+                data.startswith( 'JConfig' ):
+            return
         if data.startswith( 'EVT' ) and data != 'EVT,OK':
             discard, line, state = data.rsplit( ',', 2 )
             if self.factory.linesStates:
@@ -625,6 +737,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
 
     def connectionMade( self ):
         print self.factory.host + " connection made"
+        self.factory.setConnected( True )
         self.currentCmd = None
         self.cmdQueue = deque( [] )
         self.timeout = None
@@ -637,6 +750,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
 
     def connectionLost( self, reason ):
         print self.factory.host + " connection lost"
+        self.factory.setConnected( False )
         #self.factory = None
 
     def sendCmd( self, cmd ):
@@ -699,7 +813,7 @@ class Controller( ReconnectingClientFactory ):
                     self.setLineDir( line, 0 )
                 if self.linesModes[  line ] == 'pulse' \
                         and len( self.linesStates ) > line \
-                        and ( not self.getLineState( line ) ):
+                        and self.getLineState( line ):
                     self.setLineState( line, False )
 
     def setLineStateCB( self, line, state, data, cb = None ):
@@ -760,8 +874,10 @@ class Controller( ReconnectingClientFactory ):
         self.linesModes = {}
         self.linesStates = []
         self.callbacks = {}
+        self.devices = []
         self.pingTimer = None
         self.name = name
+        self.__connected = False
         paramsXml = db.getValue( """
             select params_xml from controllers where name = %s""",
             ( name, ) )
@@ -769,6 +885,17 @@ class Controller( ReconnectingClientFactory ):
         self.host = paramsDom.get( 'host' )
         controllers[ name ] = self
         reactor.connectTCP( self.host, 2424, self )
+
+    def getConnected( self ):
+        return self.__connected
+
+    def setConnected( self, val ):
+        print "Controller.setConnected"
+        self.__connected = val
+        for device in self.devices:
+            device.controllerConnectionChanged( val )
+
+    connected = property( getConnected, setConnected )
 
     def buildProtocol( self, addr ):
         self.protocol = ControllerProtocol()
@@ -779,71 +906,93 @@ class Controller( ReconnectingClientFactory ):
         print 'Started to connect ' + connector.getDestination().host
 
 locations, devices, controllers, prices, operations, \
-    clientConnections = {}, {}, {}, {}, {}, {}
+    clientConnections, clientButtons = [], {}, {}, {}, {}, {}, {}
 
 def charge():
     for device in devices.values():
         device.charge()
 
+def getWashClient( id ):
+    return db.getObject( 'clients', { 'id': id } )
+
 def updateClient( locationId, kwargs ):
     if clientConnections.has_key( locationId ):
         clientConnections[ locationId ].update( kwargs )
 
-locationsStr = conf.get( 'control', 'locations' )
-deviceTypesStr = conf.get( 'control', 'deviceTypes' )
-deviceTypes = [ int( s ) for s in deviceTypesStr.split( ',' ) ]
 
-devicesParams = cursor2dicts( 
-    db.execute( '''
-        select * 
-        from devices 
-        where location_id in ( %s ) and type_id in ( %s )''' % 
-        ( locationsStr, deviceTypesStr ) ), True )
+def main():
+    locationsStr = conf.get( 'control', 'locations' )
+    deviceTypesStr = conf.get( 'control', 'deviceTypes' )
+    deviceTypes = [ int( s ) for s in deviceTypesStr.split( ',' ) ]
+    locations = [ int( s ) for s in locationsStr.split( ',' ) ]
 
-pricesData = cursor2dicts(
-    db.execute( 
-        "select * from prices order by tariff, service_id, count" ), 
-    False )
-for row in pricesData:
-    if not prices.has_key( row[ 'tariff' ] ):
-        prices[ row[ 'tariff' ] ] = {}
-    if not prices[ row[ 'tariff' ] ].has_key( row[ 'service_id' ] ):
-        prices[ row[ 'tariff' ] ][ row[ 'service_id' ] ] = []
-    prices[ row[ 'tariff' ] ][ row[ 'service_id' ] ].append(
-            ( row[ 'count' ], row[ 'price' ] ) )
-
-servicesParams = {}
-for deviceType in deviceTypes:
-    servicesParams[ deviceType ] = cursor2dicts(
+    devicesParams = cursor2dicts( 
         db.execute( '''
             select * 
-            from services 
-            where type_id = %s
-            ''', ( deviceType, ) ), True )
+            from devices 
+            where location_id in ( %s ) and type_id in ( %s )''' % 
+            ( locationsStr, deviceTypesStr ) ), True )
 
-for deviceParams in devicesParams.values():
-    devices[ deviceParams['id'] ] = Device( deviceParams, 
-            servicesParams[ deviceParams[ 'type_id' ] ] )    
+    if not devicesParams:
+        print "No devices on this location!"
+        return
 
-prevOperations = cursor2dicts(
+    pricesData = cursor2dicts(
+        db.execute( 
+            "select * from prices order by tariff, service_id, count" ), 
+        False )
+    for row in pricesData:
+        if not prices.has_key( row[ 'tariff' ] ):
+            prices[ row[ 'tariff' ] ] = {}
+        if not prices[ row[ 'tariff' ] ].has_key( row[ 'service_id' ] ):
+            prices[ row[ 'tariff' ] ][ row[ 'service_id' ] ] = []
+        prices[ row[ 'tariff' ] ][ row[ 'service_id' ] ].append(
+                ( row[ 'count' ], row[ 'price' ] ) )
+
+    servicesParams = {}
+    for deviceType in deviceTypes:
+        servicesParams[ deviceType ] = cursor2dicts(
+            db.execute( '''
+                select * 
+                from services 
+                where type_id = %s
+                ''', ( deviceType, ) ), True )
+
+    for deviceParams in devicesParams.values():
+        devices[ deviceParams['id'] ] = Device( deviceParams, 
+                servicesParams[ deviceParams[ 'type_id' ] ] )    
+
+    global clientButtons
+    clientButtons = dict( [ ( l, cursor2dicts( 
         db.execute( '''
-            select id
-            from operations
-            where pay is null and location_id in ( %s ) ''' %
-            locationsStr ), True )
+            select client_id as id, image, 
+                ( select name from clients 
+                    where clients.id = client_id ) as name
+                from client_buttons 
+                where location_id = %s''',
+                ( l, ) ), False ) ) for l in locations ] )
 
-if prevOperations:
-    for opId in prevOperations.keys():
-        Operation( None, opId )
+    prevOperations = cursor2dicts(
+            db.execute( '''
+                select id
+                from operations
+                where pay is null and location_id in ( %s ) ''' %
+                locationsStr ), True )
 
-chargeCall = task.LoopingCall( charge )
-chargeCall.start( 1 )
+    if prevOperations:
+        for opId in prevOperations.keys():
+            Operation( None, opId )
 
-siteRoot = static.File( conf.get( 'common', 'siteRoot' ) + \
-        '/client-files' )
-reactor.listenTCP( 8788, server.Site( siteRoot ) )
+    chargeCall = task.LoopingCall( charge )
+    chargeCall.start( 1 )
 
-reactor.listenTCP( 8789, pb.PBServerFactory( PbServer() ) )
-reactor.run()
+    siteRoot = static.File( conf.get( 'common', 'siteRoot' ) + \
+            '/client-files' )
+    reactor.listenTCP( 8788, server.Site( siteRoot ) )
 
+    reactor.listenTCP( 8789, pb.PBServerFactory( PbServer() ) )
+    reactor.run()
+
+if __name__ == '__main__':
+    main()
 
