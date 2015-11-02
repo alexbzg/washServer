@@ -10,3 +10,8 @@ def siteConf():
     conf.read( appRoot + '/site.conf' )
     return conf
 
+def readConf( file ):
+    conf = ConfigParser.ConfigParser()
+    conf.read( appRoot + '/' + file )
+    return conf
+

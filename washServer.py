@@ -132,6 +132,23 @@ class PbConnection( pb.Referenceable ):
             if cd[ 'client' ]:
                 opr.setClient( cd[ 'client' ][ 'id' ] )
 
+        elif d.has_key( 'autoOperation' ):
+            od = d[ 'autoOperation']
+            db.getObject( 'operations', 
+                { 'location_id': self.locationId,
+                'device_id': od['device'],
+                'car_id': od['carData']['car']['id'] \
+                    if od['carData']['car'] else None,
+                'client_id': od['carData']['car']['client']['id'] \
+                    if od['carData']['car'] and \
+                    od['carData']['car']['client'] else None,
+                'service_mode': od['carData']['serviceMode'],
+                'no_lp': od['carData']['noLP'],
+                'total': od['total'],
+                'pay_sum': od['pay'] }, 
+                True )
+
+
         elif d.has_key( 'closeOperation' ):
             op = operations[ d['closeOperation']['id'] ]
             total = op.getTotal()
@@ -142,8 +159,54 @@ class PbConnection( pb.Referenceable ):
                 for np in op.car.notpayed.values():
                     db.updateObject( 'operations',
                         { 'id': np['id'], 'pay_sum': np['total'] } )
+
         elif d.has_key( 'getLPHints' ):
             self.sendLPHints( d[ 'getLPHints' ][ 'pattern' ] )
+
+        elif d.has_key( 'getShiftData' ):
+            self.sendShiftData()
+
+        elif d.has_key( 'newShift' ):
+            db.getObject( 'shifts', 
+                { 'location_id': self.locationId,
+                    'operator_id': d['newShift']['operator'] },
+                True )
+            self.sendShiftData()
+
+        elif d.has_key( 'setDetectsPresence' ):
+            devices[ d[ 'setDetectsPresence'][ 'device' ] 
+                ].setDetectsPresence(
+                    d[ 'setDetectsPresence' ][ 'value' ] )
+
+        elif d.has_key( 'linkOperation' ):
+            operations[ d['linkOperation']['id'] ].setLink(
+                d['linkOperation']['value'] )
+
+
+    def sendShiftData( self ):
+        sql = """
+            select tstamp_start, operator_id, 
+                totals[1] as qty, totals[2] as total, 
+                totals[2] - totals[3] as notpayed
+            from
+            ( select tstamp_start, operator_id, 
+                ( select ARRAY[ sum( 1 ),                               
+                        sum( round( total, 0 ) ),                  
+                        sum( pay_sum )]
+                    from operations                                 
+                    where location_id = %(location)s
+                      and not service_mode          
+                      and client_id is null                             
+                      and pay > shifts.tstamp_start ) as totals
+              from shifts
+              where location_id = %(location)s and tstamp_end is null   
+              order by tstamp_start desc                       
+              limit 1 ) as s
+            """
+        self.update( { 'shiftData': \
+            cursor2dicts( db.execute( sql, 
+                { 'location': self.locationId } ),
+                False ) } )
 
 
     def sendLPHints( self, pattern ):
@@ -154,7 +217,6 @@ class PbConnection( pb.Referenceable ):
                         where car_id = cars.id and 
                         pay > now() - interval '2 months' )
                     limit 3"""
-        hints = cursor2dicts( db.execute( sql, (pattern, ) ) )
         self.update( { 'lpHints' : \
             cursor2dicts( db.execute( sql, (pattern, ) ) ) } )
 
@@ -163,16 +225,16 @@ class PbConnection( pb.Referenceable ):
         try:
             self.clientSide.callRemote( "update", 
                 json.dumps( params, default = jsonEncodeExtra ) )
-        except pb.DeadReferenceError:
+        except (pb.PBConnectionLost, pb.DeadReferenceError), e:
             print "the client disconnected or crashed"
-            del clientConnections[ self.locationId ]
+            clientConnections[ self.locationId ].remove( self )
             return
-        f = open( conf.get( 'common', 'siteRoot' ) + \
-                '/client-files/debug/' + str( self.count ) + \
-                '.json', 'w' )
-        f.write( json.dumps( params, default = jsonEncodeExtra ) )
-        f.close()
-        self.count += 1
+#        f = open( conf.get( 'common', 'siteRoot' ) + \
+#                '/client-files/debug/' + str( self.count ) + \
+#                '.json', 'w' )
+#        f.write( json.dumps( params, default = jsonEncodeExtra ) )
+#        f.close()
+#        self.count += 1
 
 
 class PbServer( pb.Root ):
@@ -181,7 +243,9 @@ class PbServer( pb.Root ):
         pbc.clientSide = clientSide
         pbc.locationId = locationId
         pbc.count = 0
-        clientConnections[ locationId ] = pbc
+        if not clientConnections.has_key( locationId ):
+            clientConnections[ locationId ] = []
+        clientConnections[ locationId ].append( pbc )
         pbc.update( 
             { 'devices': 
                 dict( ( id, devices[ id ].toDict() ) 
@@ -194,6 +258,7 @@ class PbServer( pb.Root ):
             'clientButtons':
                 clientButtons[ locationId ] \
                 if clientButtons.has_key( locationId ) else None,
+            'operators': operators,
             'create': True } )
         return pbc
 
@@ -248,28 +313,41 @@ class Device:
         for service in self.services.values():
             if service.default:
                 service.signal( type )
-
+        
     def controllerConnectionChanged( self, val ):
         self.updateClient( controllersConnection = \
                 self.controllersConnection )
 
+    def setDetectsPresence( self, val ):
+        if val != self.detectsPresence:
+            self.detectsPresence = val
+            db.updateObject( 'devices', 
+                    { 'id': self.id, 'detects_presence': val } )
+            if self.detectsPresence and self.presence:
+                self.presence = False
+                self.setPresence( True )
+
     def setPresence( self, val ):
-        if self.detectsPresence and self.presence != val:
-            self.presence = val
-            if self.presence:
-                print self.name + " presence on"
-                if not self.active:
-                    self.presenceTimer = reactor.callLater(
-                        conf.getfloat( 'control', 'presenceInterval' ),
-                        lambda: self.onPresenceTimer() )
+        if self.presence != val:
+            if self.detectsPresence:
+                self.presence = val
+                if self.presence:
+                    print self.name + " presence on"
+                    if not self.active:
+                        self.presenceTimer = reactor.callLater(
+                            conf.getfloat( 'control', 
+                                'presenceInterval' ),
+                            lambda: self.onPresenceTimer() )
+                else:
+                    if self.active:
+                        self.stopping = True
+                        self.signal( 'stop' )
+                    if self.presenceTimer:
+                        self.presenceTimer.cancel()
+                        self.presenceTimer = None
+                    print self.name + " presence off"
             else:
-                if self.active:
-                    self.stopping = True
-                    self.signal( 'stop' )
-                if self.presenceTimer:
-                    self.presenceTimer.cancel()
-                    self.presenceTimer = None
-                print self.name + " presence off"
+                self.presence = val
 
     def onPresenceTimer( self ):
         self.signal( 'start' )
@@ -295,6 +373,14 @@ class Device:
                 for service in self.services.values():
                     service.operationDetail = None
             self.updateClient( active = False )
+            self.UARTsend( 0 )
+            
+    def UARTsend( self, val ):
+        if self.UARTvalue != val:
+            for controller in self.controllers:
+                controller.UARTsend( val )
+            self.UARTvalue = val
+
 
     def charge( self ):
         if self.active:
@@ -306,6 +392,9 @@ class Device:
                 'detectsPresence': self.detectsPresence,
                 'active': self.active,
                 'controllersConnection': self.controllersConnection,
+                'paramsXML': self.paramsXML,
+                'auto': self.auto,
+                'parentId': self.parentId,
                 'services': dict( ( id, self.services[ id ].toDict() )
                     for id in self.services.keys() ) }
 
@@ -316,15 +405,21 @@ class Device:
         self.pause = False
         self.active = False
         self.operation = None
+        self.UARTvalue = 0
         self.controllers = []
         self.type = params[ 'type_id' ]
         self.name = params[ 'name' ]
         self.tariff = params[ 'tariff' ]
         self.locationId = params[ 'location_id' ]
         self.detectsPresence = params[ 'detects_presence' ]
+        self.parentId = params['parent_id']
+        self.parent = None
         self.presence = False
         self.events = []
         self.presenceTimer = None
+        self.auto = self.type == 2
+        self.paramsXML = params['params_xml'] if \
+            params.has_key( 'params_xml' ) else None
         if servicesParams:
             self.services = dict( zip( servicesParams.keys(), 
                 [ Service( serviceParams, self ) for serviceParams in 
@@ -489,6 +584,9 @@ class Operation:
         self.serviceMode = False
         self.client = None
         self.device = None
+        self.UARTtotal = 0
+        self.parent = None
+        self.children = {}
         if id:
             dbData = db.getObject( 'operations', { 'id': id } )
             self.id = id
@@ -511,6 +609,9 @@ class Operation:
                 self.setServiceMode()
             if dbData[ 'client_id' ]:
                 self.client = getWashClient( dbData[ 'client_id' ] )
+            if dbData[ 'parent_id' ]:
+                self.setParent( 
+                        Operation( None, dbData[ 'parent_id' ] ) )
             detailData = cursor2dicts( db.execute ( '''
                 select * from operation_detail where operation_id = 
                 ''' + str( id ) ), True )
@@ -536,6 +637,44 @@ class Operation:
         updateClient( self.locationId,
                 { 'operations': { self.id: self.toDict() },
                     'create': True } )
+
+    def setParent( self, parent ):
+        if parent == self.parent:
+            return
+        if parent:
+            self.parent = parent
+            parent.children[ self.id ] = self
+            if self.parent.car != self.car:
+                if self.parent.car:
+                    self.setCar( self.parent.car )
+                else:
+                    self.parent.setCar( self.car )
+            if self.parent.client != self.client:
+                if self.parent.client:
+                    self.setClient( self.parent.client )
+                else:
+                    self.parent.setClient( self.client )
+            if self.parent.serviceMode != self.serviceMode:
+                if self.parent.serviceMode:
+                    self.setServiceMode()
+                else:
+                    self.parent.setServiceMode()
+            if self.parent.noLP != self.noLP:
+                if self.parent.noLP:
+                    self.setNoLP()
+                else:
+                    self.parent.setNoLP()
+        elif self.parent:
+            del self.parent.children[ self.id ]
+        self.recalc()
+
+    def setLink( self, value ):
+        if value and self.device.operation == self and \
+            self.device.parent and self.device.parent.operation:
+            self.setParent( self.device.parent.operation )
+        elif not value:
+            self.setParent( None )
+
         
 
     def getTotal( self ):
@@ -544,6 +683,12 @@ class Operation:
             for serviceId in self.details[ deviceId ].keys():
                 r += self.details[ deviceId ][ serviceId ].total
         return r
+
+    def recalc( self ):
+        for deviceId in self.details.keys():
+            for serviceId in self.details[ deviceId ].keys():
+                self.details[ deviceId ][ serviceId ].recalc()
+   
 
     def toDict( self ):
         return { 'id': self.id,
@@ -565,7 +710,8 @@ class Operation:
 
     def stop( self ):
         if ( not self.tstamp_stop ):
-            self.tstamp_stop = ( self.update( current_device_id = None ) 
+            self.tstamp_stop = ( 
+                self.update( current_device_id = None ) 
                     )[ 'tstamp_end' ] 
         self.updateClient( 
                 stop = formatDT( self.tstamp_stop, '%H:%M' ) )
@@ -620,6 +766,20 @@ class Operation:
                 client_id = self.client['id'] if self.client else None,
                 service_mode = self.serviceMode,
                 no_lp = self.noLP )
+        if self.parent:
+            self.copyCarData( self.parent )
+        for child in self.children.values():
+            self.copyCarData( child )
+
+    def copyCarData( self, dst ):
+        if self.car != dst.car:
+            dst.setCar( self.car )
+        if self.client != dst.client:
+            dst.setClient( self.client )
+        if self.serviceMode and not dst.serviceMode:
+            dst.setServiceMode()
+        if self.noLP and not dst.noLP:
+            dst.setNoLP()
 
 class OperationDetail:
     def __init__( self, service, operation ):
@@ -660,8 +820,9 @@ class OperationDetail:
             ( self.charged > self.qty + self.service.tarification ):
             self.charged = ( ( self.qty // self.service.tarification ) \
                     + 1 ) * self.service.tarification
-            if self.service.device != self.operation.device and \
-                    self.service.default:
+            if ( self.service.device != self.operation.device and \
+                self.service.default ) or \
+                ( self.operation.parent and self.service.default ):
                 self.total = 0
             else:
                 self.total = 0
@@ -681,7 +842,7 @@ class OperationDetail:
                 db.updateObject( 'operation_detail',
                         { 'id': self.id, 'qty': self.qty, 
                             'total': self.total } )
-        if self.operation.device:
+        if self.operation.device.operation == self.operation:
             updateClient( self.operation.locationId, 
                 { 'operations': 
                     { self.operation.id: 
@@ -689,6 +850,11 @@ class OperationDetail:
                             { self.device.id: 
                                 { self.service.id: { 'qty': self.qty, 
                                     'total': self.total } } } } } } )
+            newUtotal = int( round( self.operation.getTotal() ) )
+            while newUtotal > 1000:
+                newUtotal -= 1000
+            self.operation.device.UARTsend( newUtotal )
+
 
 
         
@@ -743,7 +909,8 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
         self.timeout = None
         self.pingTimer = None
         self.queueCmd( '' )
-        self.queueCmd( "PSW,SET,Jerome" )
+        self.queueCmd( "PSW,SET,Jerome", 
+                lambda x: self.factory.UARTconnect() )
         self.queueCmd( "EVT,ON" )
         self.queueCmd( "IO,GET,ALL", self.factory.saveLinesDirs )
         self.queueCmd( "RID,ALL", self.factory.saveLinesStates )
@@ -774,8 +941,37 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
             self.currentCmd = ( cmd, cb )
             self.sendCmd( cmd )
 
+class UARTProtocol( StatefulTelnetProtocol ):
+    def connectionMade( self ):
+        self.factory.controller.UARTsend( 0 )
+        print self.factory.controller.host + ' UART connection made'
+
+
+class UARTConnection( ClientFactory ):
+    maxDelay = 15
+
+    def __init__( self, controller ):
+        self.controller = controller
+
+    def buildProtocol( self, addr ):
+        self.protocol = UARTProtocol()
+        self.controller.UARTconnection = self.protocol
+        self.protocol.factory = self
+        return self.protocol
+  
+    def clientConnectionLost(self, connector, reason):
+        print self.controller.host + \
+                ' UART connection lost or failed ' + \
+                reason.getErrorMessage()
+        self.controller.UARTconnectionLost()
+
+    def clientConnectionFailed(self, connector, reason):
+        self.clientConnectionLost( connector, reason )
+
 class Controller( ReconnectingClientFactory ):
     maxDelay = 15
+    UARTinterval = conf.getfloat( 'control', 'UARTinterval' )
+   
 
     def toggleLine( self, line, cb = None ):
         self.setLineState( line, not self.getLineState( line ), cb )
@@ -876,6 +1072,9 @@ class Controller( ReconnectingClientFactory ):
         self.callbacks = {}
         self.devices = []
         self.pingTimer = None
+        self.UARTconnection = None
+        self.UARTcache = []
+        self.UARTtimer = None
         self.name = name
         self.__connected = False
         paramsXml = db.getValue( """
@@ -883,17 +1082,68 @@ class Controller( ReconnectingClientFactory ):
             ( name, ) )
         paramsDom = etree.fromstring( paramsXml )
         self.host = paramsDom.get( 'host' )
+        self.UART = paramsDom.get( 'UART' )
         controllers[ name ] = self
         reactor.connectTCP( self.host, 2424, self )
+
+    def UARTconnect( self ):
+        if self.UART:
+            reactor.connectTCP( self.host, 2525, 
+                    UARTConnection( self ) )
+            self.setUARTtimer()
+
+    def UARTsend( self, val ):
+        if self.UARTconnection:
+            data = [40, 41, 42]
+            co = 0
+            while val:
+                data[ co ] = ( ( val % 10 ) << 2 ) | co
+                co += 1
+                val /= 10
+
+            self.UARTcache = data
+
+            for d in data:
+                self.UARTconnection.transport.write( chr( d ) )
+            if self.UARTtimer and self.UARTtimer.active():
+                self.UARTtimer.cancel()
+            self.setUARTtimer()
+
+    def setUARTtimer( self ):
+        if self.UARTconnection:
+            self.UARTtimer = reactor.callLater( self.UARTinterval,
+                lambda: self.UARTrepeat() )
+
+
+    def UARTrepeat( self ):
+        if self.UARTconnection:
+            for d in self.UARTcache:
+                self.UARTconnection.transport.write( chr( d ) )
+            self.setUARTtimer()
+
+    def UARTconnectionLost( self ):
+        if self.UARTconnection:
+            self.UARTconnection.factory.stopFactory()
+        if self.UARTtimer and self.UARTtimer.active():
+            self.UARTtimer.cancel()
+        if self.connected and self.UART:
+            self.UARTconnect()
+
+
+       
 
     def getConnected( self ):
         return self.__connected
 
     def setConnected( self, val ):
-        print "Controller.setConnected"
+        print "Controller " + self.host + ' connected: ' + str( val )
         self.__connected = val
         for device in self.devices:
             device.controllerConnectionChanged( val )
+        if not val and self.UARTconnection:
+            self.UARTconnection.factory.stopFactory()
+            "Controller " + self.host + ' UART disconnected'
+            self.UARTconnection = None
 
     connected = property( getConnected, setConnected )
 
@@ -906,7 +1156,8 @@ class Controller( ReconnectingClientFactory ):
         print 'Started to connect ' + connector.getDestination().host
 
 locations, devices, controllers, prices, operations, \
-    clientConnections, clientButtons = [], {}, {}, {}, {}, {}, {}
+    clientConnections, clientButtons, operators = \
+    [], {}, {}, {}, {}, {}, {}, []
 
 def charge():
     for device in devices.values():
@@ -917,7 +1168,12 @@ def getWashClient( id ):
 
 def updateClient( locationId, kwargs ):
     if clientConnections.has_key( locationId ):
-        clientConnections[ locationId ].update( kwargs )
+        for cc in clientConnections[ locationId ]:
+            try:
+                cc.update( kwargs )
+            except (pb.PBConnectionLost, pb.DeadReferenceError), e:
+                clientConnections[ locationId ].remove( cc )
+                print "Client connection is lost!"
 
 
 def main():
@@ -939,7 +1195,7 @@ def main():
 
     pricesData = cursor2dicts(
         db.execute( 
-            "select * from prices order by tariff, service_id, count" ), 
+        "select * from prices order by tariff, service_id, count" ), 
         False )
     for row in pricesData:
         if not prices.has_key( row[ 'tariff' ] ):
@@ -961,6 +1217,9 @@ def main():
     for deviceParams in devicesParams.values():
         devices[ deviceParams['id'] ] = Device( deviceParams, 
                 servicesParams[ deviceParams[ 'type_id' ] ] )    
+    for device in devices.values():
+        if device.parentId:
+            device.parent = devices[ device.parentId ]
 
     global clientButtons
     clientButtons = dict( [ ( l, cursor2dicts( 
@@ -972,6 +1231,11 @@ def main():
                 where location_id = %s''',
                 ( l, ) ), False ) ) for l in locations ] )
 
+    global operators 
+    operators = cursor2dicts( db.execute( '''
+        select id, name from operators where active''' ),
+        False )
+
     prevOperations = cursor2dicts(
             db.execute( '''
                 select id
@@ -981,7 +1245,8 @@ def main():
 
     if prevOperations:
         for opId in prevOperations.keys():
-            Operation( None, opId )
+            if not opId in operations:
+                Operation( None, opId )
 
     chargeCall = task.LoopingCall( charge )
     chargeCall.start( 1 )
