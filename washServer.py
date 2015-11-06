@@ -1096,6 +1096,8 @@ class Controller( ReconnectingClientFactory ):
         if self.UARTconnection:
             data = [40, 41, 42]
             co = 0
+            while val > 1000:
+                val -= 1000
             while val:
                 data[ co ] = ( ( val % 10 ) << 2 ) | co
                 co += 1
