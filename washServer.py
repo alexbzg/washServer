@@ -6,22 +6,45 @@ from twisted.conch.telnet import StatefulTelnetProtocol
 from twisted.python import log
 from twisted.spread import pb
 from twisted.web import static, server
-import sys
-log.startLogging(sys.stdout)
+import sys, decimal, re, datetime, os, logging
+#log.startLogging(sys.stdout)
+from twisted.conch.telnet import TelnetTransport, StatefulTelnetProtocol
 
 from lxml import etree
 from collections import deque
 
-from common import siteConf, appRoot
+from common import appRoot, readConf
 from washDB import db, cursor2dicts
 import simplejson as json
-import decimal
-import datetime
-import re
 from datetime import date, timedelta
+
+args = {}
+args['t'] = '-t' in sys.argv
+postfix = '_t' if args['t'] else ''
+conf = readConf( 'site' + postfix + '.conf' )
+pidFile = open( appRoot + '/washServer' + postfix + '.pid', 'w' )
+pidFile.write( str( os.getpid() ) )
+pidFile.close()
+observer = log.PythonLoggingObserver()
+observer.start()
+logging.basicConfig( level = logging.DEBUG if args['t'] else logging.ERROR,
+        format='%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S' )
+log.msg( 'starting in test mode' )
+
+locations, devices, controllers, prices, operations, \
+    clientConnections, clientButtons, operators = \
+    [], {}, {}, {}, {}, {}, {}, []
+
 
 def formatDT( date, format ):
     return date.strftime( format ) if date else None
+
+def epoch( date ):
+    if date:
+        td = date - datetime.datetime(1970,1,1)
+        return td.seconds + td.days * 24 * 3600
+    else:
+        return None
 
 
 def jsonEncodeExtra( obj ):
@@ -31,10 +54,9 @@ def jsonEncodeExtra( obj ):
         return obj.isoformat()
     if hasattr( obj, '__dict__' ):
         return None
-    print repr( obj ) + " is not JSON serializable"
+    log.err( repr( obj ) + " is not JSON serializable" )
     return None
 
-conf = siteConf()
 
 class Car:
     reLP = re.compile( '^(.{5,}\D)(\d+)$', re.U )
@@ -226,15 +248,17 @@ class PbConnection( pb.Referenceable ):
             self.clientSide.callRemote( "update", 
                 json.dumps( params, default = jsonEncodeExtra ) )
         except (pb.PBConnectionLost, pb.DeadReferenceError), e:
-            print "the client disconnected or crashed"
+            log.msg( type( e ).__name__ )
+            log.err( "the client disconnected or crashed" )
             clientConnections[ self.locationId ].remove( self )
             return
-#        f = open( conf.get( 'common', 'siteRoot' ) + \
-#                '/client-files/debug/' + str( self.count ) + \
-#                '.json', 'w' )
-#        f.write( json.dumps( params, default = jsonEncodeExtra ) )
-#        f.close()
-#        self.count += 1
+        if args['t']:
+            f = open( conf.get( 'common', 'siteRoot' ) + \
+                '/debug/' + str( self.count ) + \
+                '.json', 'w' )
+            f.write( json.dumps( params, default = jsonEncodeExtra ) )
+            f.close()
+            self.count += 1
 
 
 class PbServer( pb.Root ):
@@ -287,9 +311,9 @@ class Device:
                 self.timer = None
 
         def triggerAction( self ):
-            print 'trigger on line ' + self.node.get( 'line' ) + \
+            log.msg( 'trigger on line ' + self.node.get( 'line' ) + \
                     ' signal ' + self.node.get( 'signal' ) + \
-                    ' continues ' + str( self.node.get( 'continues' ) )
+                    ' continues ' + str( self.node.get( 'continues' ) ) )
             for signalAction in self.node.xpath( 
                     'action[ @type = "signal" ]' ):
                 self.controller.setLineState( 
@@ -332,7 +356,7 @@ class Device:
             if self.detectsPresence:
                 self.presence = val
                 if self.presence:
-                    print self.name + " presence on"
+                    log.msg( self.name + " presence on" )
                     if not self.active:
                         self.presenceTimer = reactor.callLater(
                             conf.getfloat( 'control', 
@@ -345,7 +369,7 @@ class Device:
                     if self.presenceTimer:
                         self.presenceTimer.cancel()
                         self.presenceTimer = None
-                    print self.name + " presence off"
+                    log.msg( self.name + " presence off" )
             else:
                 self.presence = val
 
@@ -535,8 +559,7 @@ class Service:
     def start( self ):
         if not self.active:
             self.active = True
-            print ( self.device.name + " " + self.name + " start" \
-                    )
+            log.msg( self.device.name + " " + self.name + " start" )
             if self.default:
                 if self.device.pause:
                     self.device.pause = False
@@ -550,8 +573,7 @@ class Service:
     def stop( self ):
         if self.active:
             self.active = False
-            print ( self.device.name + " " + self.name + " stop" \
-                    )
+            log.msg( self.device.name + " " + self.name + " stop" )
             if self.default:
                 if self.device.stopping:
                     self.device.stop()
@@ -596,7 +618,9 @@ class Operation:
             if dbData[ 'device_id' ]:
                 self.device = devices[ dbData[ 'device_id' ] ]
             if dbData[ 'current_device_id' ] and \
-                devices[ dbData[ 'current_device_id' ] ].active:
+                ( devices[ dbData[ 'current_device_id' ] ].active or \
+                not devices[ dbData[ 'current_device_id' ] \
+                    ].controllersConnection ):
                 self.device = devices[ dbData[ 'current_device_id' ] ]
                 self.device.operation = self
             else:
@@ -693,7 +717,9 @@ class Operation:
     def toDict( self ):
         return { 'id': self.id,
                 'start': formatDT( self.tstamp_start, '%H:%M' ),
+                'startEpoch': epoch( self.tstamp_start ),
                 'stop': formatDT( self.tstamp_stop, '%H:%M' ),
+                'stopEpoch': epoch( self.tstamp_stop ),
                 'device': self.device.id if self.device else None,
                 'noLP': self.noLP,
                 'serviceMode': self.serviceMode,
@@ -714,7 +740,8 @@ class Operation:
                 self.update( current_device_id = None ) 
                     )[ 'tstamp_end' ] 
         self.updateClient( 
-                stop = formatDT( self.tstamp_stop, '%H:%M' ) )
+                stop = formatDT( self.tstamp_stop, '%H:%M' ),
+                stopEpoch = epoch( self.tstamp_stop ) )
 
     def update( self, **params ):
         params[ 'id' ] = self.id
@@ -870,7 +897,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
 
     def lineReceived(self, data):
         data = data.replace( '#', '' ).replace( '\r', '' )
-        print self.factory.host + ' ' + data
+        log.msg( self.factory.host + ' ' + data )
         if self.pingTimer:
             self.pingTimer.cancel()
             self.pingTimer = None;
@@ -889,8 +916,8 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
                     self.timeout.cancel()
                     self.timeout = None
                 if data == 'ERR':
-                    print self.factory.host + \
-                        ' error in response to ' + self.currentCmd[0]
+                    log.err( self.factory.host + \
+                        ' error in response to ' + self.currentCmd[0] )
                 cmd, cb = self.currentCmd
                 self.currentCmd = None
                 if data != 'OK' and data != 'ERR':
@@ -902,7 +929,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
                     cb( data )
 
     def connectionMade( self ):
-        print self.factory.host + " connection made"
+        log.err( self.factory.host + " connection made" )
         self.factory.setConnected( True )
         self.currentCmd = None
         self.cmdQueue = deque( [] )
@@ -916,12 +943,12 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
         self.queueCmd( "RID,ALL", self.factory.saveLinesStates )
 
     def connectionLost( self, reason ):
-        print self.factory.host + " connection lost"
+        log.err( self.factory.host + " connection lost" )
         self.factory.setConnected( False )
         #self.factory = None
 
     def sendCmd( self, cmd ):
-        print self.factory.host + ' ' + cmd   
+        log.msg( self.factory.host + ' ' + cmd )
         fullCmd = cmd
         if cmd != '':
             fullCmd = "," + fullCmd
@@ -931,7 +958,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
                 lambda: self.callTimeout() )
 
     def callTimeout( self ):
-        print self.factory.host + " timeout"
+        log.err( self.factory.host + " timeout" )
         self.transport.loseConnection()
 
     def queueCmd( self, cmd, cb = None ):
@@ -944,7 +971,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
 class UARTProtocol( StatefulTelnetProtocol ):
     def connectionMade( self ):
         self.factory.controller.UARTsend( 0 )
-        print self.factory.controller.host + ' UART connection made'
+        log.err( self.factory.controller.host + ' UART connection made' )
 
 
 class UARTConnection( ClientFactory ):
@@ -960,9 +987,9 @@ class UARTConnection( ClientFactory ):
         return self.protocol
   
     def clientConnectionLost(self, connector, reason):
-        print self.controller.host + \
+        log.err( self.controller.host + \
                 ' UART connection lost or failed ' + \
-                reason.getErrorMessage()
+                reason.getErrorMessage() )
         self.controller.UARTconnectionLost()
 
     def clientConnectionFailed(self, connector, reason):
@@ -1019,7 +1046,6 @@ class Controller( ReconnectingClientFactory ):
             cb( data )
 
     def pulseLineCB( self, line, data, cb = None ):
-        #print "pulse Line cb " + str( line ) + ': ' + data
         if data == 'OK':
             reactor.callLater( 0.3, 
                     lambda: self.toggleLine( line, cb ) )
@@ -1060,7 +1086,7 @@ class Controller( ReconnectingClientFactory ):
     def saveLineState( self, line, state ):
         if self.linesStates[ line ] != ( state == '1' ):
             self.linesStates[ line ] = ( state == '1' )
-            print "line " + str( line ) + ": " + str( state )
+            log.msg( "line " + str( line ) + ": " + str( state ) )
             if self.callbacks.get( line ):
                 for callback in self.callbacks[ line ]:
                     callback( self.linesStates[ line ] )
@@ -1129,7 +1155,7 @@ class Controller( ReconnectingClientFactory ):
         if self.UARTtimer and self.UARTtimer.active():
             self.UARTtimer.cancel()
         if self.connected and self.UART:
-            self.UARTconnect()
+            reactor.callLater( 5, self.UARTconnect )
 
 
        
@@ -1138,13 +1164,14 @@ class Controller( ReconnectingClientFactory ):
         return self.__connected
 
     def setConnected( self, val ):
-        print "Controller " + self.host + ' connected: ' + str( val )
+        log.err( "Controller " + self.host + \
+                ' connected: ' + str( val ) )
         self.__connected = val
         for device in self.devices:
             device.controllerConnectionChanged( val )
         if not val and self.UARTconnection:
             self.UARTconnection.factory.stopFactory()
-            "Controller " + self.host + ' UART disconnected'
+            log.err( "Controller " + self.host + ' UART disconnected' )
             self.UARTconnection = None
 
     connected = property( getConnected, setConnected )
@@ -1155,11 +1182,8 @@ class Controller( ReconnectingClientFactory ):
         return self.protocol
 
     def startedConnecting(self, connector):
-        print 'Started to connect ' + connector.getDestination().host
-
-locations, devices, controllers, prices, operations, \
-    clientConnections, clientButtons, operators = \
-    [], {}, {}, {}, {}, {}, {}, []
+        log.msg( 'Started to connect ' + 
+                connector.getDestination().host )
 
 def charge():
     for device in devices.values():
@@ -1171,11 +1195,7 @@ def getWashClient( id ):
 def updateClient( locationId, kwargs ):
     if clientConnections.has_key( locationId ):
         for cc in clientConnections[ locationId ]:
-            try:
-                cc.update( kwargs )
-            except (pb.PBConnectionLost, pb.DeadReferenceError), e:
-                clientConnections[ locationId ].remove( cc )
-                print "Client connection is lost!"
+            cc.update( kwargs )
 
 
 def main():
@@ -1192,7 +1212,7 @@ def main():
             ( locationsStr, deviceTypesStr ) ), True )
 
     if not devicesParams:
-        print "No devices on this location!"
+        log.err( "No devices on this location!" )
         return
 
     pricesData = cursor2dicts(
@@ -1253,11 +1273,11 @@ def main():
     chargeCall = task.LoopingCall( charge )
     chargeCall.start( 1 )
 
-    siteRoot = static.File( conf.get( 'common', 'siteRoot' ) + \
-            '/client-files' )
-    reactor.listenTCP( 8788, server.Site( siteRoot ) )
-
-    reactor.listenTCP( 8789, pb.PBServerFactory( PbServer() ) )
+    siteRoot = static.File( conf.get( 'common', 'siteRoot' ) )
+    reactor.listenTCP( conf.getint( 'common', 'httpPort' ), 
+            server.Site( siteRoot ) )
+    reactor.listenTCP( conf.getint( 'common', 'pbPort' ), 
+            pb.PBServerFactory( PbServer() ) )
     reactor.run()
 
 if __name__ == '__main__':

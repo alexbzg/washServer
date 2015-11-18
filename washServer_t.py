@@ -1,7 +1,7 @@
 #!/usr/bin/python
 #coding=utf-8
 from twisted.internet import reactor, protocol, task
-from twisted.internet.protocol import ClientFactory, ReconnectingClientFactory
+from twisted.internet.protocol import ClientFactory, ReconnectingClientFactory, ClientCreator
 from twisted.conch.telnet import StatefulTelnetProtocol
 from twisted.python import log
 from twisted.spread import pb
@@ -969,31 +969,16 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
             self.sendCmd( cmd )
 
 class UARTProtocol( StatefulTelnetProtocol ):
-    def connectionMade( self ):
-        self.factory.controller.UARTsend( 0 )
-        log.err( self.factory.controller.host + ' UART connection made' )
 
-
-class UARTConnection( ClientFactory ):
-    maxDelay = 15
-
-    def __init__( self, controller ):
-        self.controller = controller
-
-    def buildProtocol( self, addr ):
-        self.protocol = UARTProtocol()
-        self.controller.UARTconnection = self.protocol
-        self.protocol.factory = self
-        return self.protocol
-  
-    def clientConnectionLost(self, connector, reason):
+    def connectionLost( self, reason ):
         log.err( self.controller.host + \
                 ' UART connection lost or failed ' + \
                 reason.getErrorMessage() )
         self.controller.UARTconnectionLost()
 
-    def clientConnectionFailed(self, connector, reason):
-        self.clientConnectionLost( connector, reason )
+
+UARTClientCreator = ClientCreator( reactor, UARTProtocol )
+
 
 class Controller( ReconnectingClientFactory ):
     maxDelay = 15
@@ -1112,11 +1097,17 @@ class Controller( ReconnectingClientFactory ):
         controllers[ name ] = self
         reactor.connectTCP( self.host, 2424, self )
 
+    def UARTonProtocol( self, p ):
+        self.UARTconnection = p
+        p.controller = self
+        self.setUARTtimer()
+        self.UARTsend( 0 )
+        log.err( self.host + ' UART connected' )
+
     def UARTconnect( self ):
         if self.UART:
-            reactor.connectTCP( self.host, 2525, 
-                    UARTConnection( self ) )
-            self.setUARTtimer()
+            uc = UARTClientCreator.connectTCP( self.host, 2525 )
+            uc.addCallback( self.UARTonProtocol )
 
     def UARTsend( self, val ):
         if self.UARTconnection:
@@ -1150,12 +1141,11 @@ class Controller( ReconnectingClientFactory ):
             self.setUARTtimer()
 
     def UARTconnectionLost( self ):
-        if self.UARTconnection:
-            self.UARTconnection.factory.stopFactory()
+        self.UARTconnection = None
         if self.UARTtimer and self.UARTtimer.active():
             self.UARTtimer.cancel()
         if self.connected and self.UART:
-            reactor.calllater( 5, self.UARTconnect )
+            reactor.callLater( 5, self.UARTconnect )
 
 
        
@@ -1170,7 +1160,6 @@ class Controller( ReconnectingClientFactory ):
         for device in self.devices:
             device.controllerConnectionChanged( val )
         if not val and self.UARTconnection:
-            self.UARTconnection.factory.stopFactory()
             log.err( "Controller " + self.host + ' UART disconnected' )
             self.UARTconnection = None
 
