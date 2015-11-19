@@ -4,7 +4,6 @@ from twisted.internet import reactor, protocol, task
 from twisted.internet.protocol import ClientFactory, ReconnectingClientFactory, ClientCreator
 from twisted.conch.telnet import TelnetTransport, StatefulTelnetProtocol
 import logging
-from lxml import etree
 from collections import deque
 
 class ControllerProtocol( StatefulTelnetProtocol, object ):
@@ -208,7 +207,8 @@ class Controller( ReconnectingClientFactory ):
         self.UARTcache = []
         self.UARTtimer = None
         self.__connected = False
-        self.name = params[ 'name' ]
+        if params.has_key( 'name' ):
+            self.name = params[ 'name' ]
         self.host = params[ 'host' ]
         self.UART = params[ 'UART' ]
         reactor.connectTCP( self.host, 2424, self )
