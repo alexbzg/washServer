@@ -1,7 +1,7 @@
 #!/usr/bin/python
 #coding=utf-8
 from twisted.internet import reactor, protocol, task
-from twisted.internet.protocol import ClientFactory, ReconnectingClientFactory
+from twisted.internet.protocol import ClientFactory, ReconnectingClientFactory, ClientCreator
 from twisted.conch.telnet import StatefulTelnetProtocol
 from twisted.python import log
 from twisted.spread import pb
@@ -28,8 +28,9 @@ pidFile.close()
 observer = log.PythonLoggingObserver()
 observer.start()
 logging.basicConfig( level = logging.DEBUG if args['t'] else logging.ERROR,
-        format='%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S' )
-log.msg( 'starting in test mode' )
+        format='%(asctime)s %(message)s', 
+        datefmt='%Y-%m-%d %H:%M:%S' )
+logging.info( 'starting in test mode' )
 
 locations, devices, controllers, prices, operations, \
     clientConnections, clientButtons, operators = \
@@ -54,7 +55,7 @@ def jsonEncodeExtra( obj ):
         return obj.isoformat()
     if hasattr( obj, '__dict__' ):
         return None
-    log.err( repr( obj ) + " is not JSON serializable" )
+    logging.error( repr( obj ) + " is not JSON serializable" )
     return None
 
 
@@ -208,7 +209,7 @@ class PbConnection( pb.Referenceable ):
     def sendShiftData( self ):
         sql = """
             select tstamp_start, operator_id, 
-                totals[1] as qty, totals[2] as total, 
+                totals[1] as qty, totals[3] as total, 
                 totals[2] - totals[3] as notpayed
             from
             ( select tstamp_start, operator_id, 
@@ -248,8 +249,8 @@ class PbConnection( pb.Referenceable ):
             self.clientSide.callRemote( "update", 
                 json.dumps( params, default = jsonEncodeExtra ) )
         except (pb.PBConnectionLost, pb.DeadReferenceError), e:
-            log.msg( type( e ).__name__ )
-            log.err( "the client disconnected or crashed" )
+            logging.info( type( e ).__name__ )
+            logging.error( "the client disconnected or crashed" )
             clientConnections[ self.locationId ].remove( self )
             return
         if args['t']:
@@ -311,7 +312,7 @@ class Device:
                 self.timer = None
 
         def triggerAction( self ):
-            log.msg( 'trigger on line ' + self.node.get( 'line' ) + \
+            logging.info( 'trigger on line ' + self.node.get( 'line' ) + \
                     ' signal ' + self.node.get( 'signal' ) + \
                     ' continues ' + str( self.node.get( 'continues' ) ) )
             for signalAction in self.node.xpath( 
@@ -356,7 +357,7 @@ class Device:
             if self.detectsPresence:
                 self.presence = val
                 if self.presence:
-                    log.msg( self.name + " presence on" )
+                    logging.info( self.name + " presence on" )
                     if not self.active:
                         self.presenceTimer = reactor.callLater(
                             conf.getfloat( 'control', 
@@ -369,7 +370,7 @@ class Device:
                     if self.presenceTimer:
                         self.presenceTimer.cancel()
                         self.presenceTimer = None
-                    log.msg( self.name + " presence off" )
+                    logging.info( self.name + " presence off" )
             else:
                 self.presence = val
 
@@ -559,7 +560,7 @@ class Service:
     def start( self ):
         if not self.active:
             self.active = True
-            log.msg( self.device.name + " " + self.name + " start" )
+            logging.info( self.device.name + " " + self.name + " start" )
             if self.default:
                 if self.device.pause:
                     self.device.pause = False
@@ -573,7 +574,7 @@ class Service:
     def stop( self ):
         if self.active:
             self.active = False
-            log.msg( self.device.name + " " + self.name + " stop" )
+            logging.info( self.device.name + " " + self.name + " stop" )
             if self.default:
                 if self.device.stopping:
                     self.device.stop()
@@ -897,7 +898,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
 
     def lineReceived(self, data):
         data = data.replace( '#', '' ).replace( '\r', '' )
-        log.msg( self.factory.host + ' ' + data )
+        logging.info( self.factory.host + ' ' + data )
         if self.pingTimer:
             self.pingTimer.cancel()
             self.pingTimer = None;
@@ -916,7 +917,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
                     self.timeout.cancel()
                     self.timeout = None
                 if data == 'ERR':
-                    log.err( self.factory.host + \
+                    logging.error( self.factory.host + \
                         ' error in response to ' + self.currentCmd[0] )
                 cmd, cb = self.currentCmd
                 self.currentCmd = None
@@ -929,7 +930,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
                     cb( data )
 
     def connectionMade( self ):
-        log.err( self.factory.host + " connection made" )
+        logging.error( self.factory.host + " connection made" )
         self.factory.setConnected( True )
         self.currentCmd = None
         self.cmdQueue = deque( [] )
@@ -943,12 +944,12 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
         self.queueCmd( "RID,ALL", self.factory.saveLinesStates )
 
     def connectionLost( self, reason ):
-        log.err( self.factory.host + " connection lost" )
+        logging.error( self.factory.host + " connection lost" )
         self.factory.setConnected( False )
         #self.factory = None
 
     def sendCmd( self, cmd ):
-        log.msg( self.factory.host + ' ' + cmd )
+        logging.info( self.factory.host + ' ' + cmd )
         fullCmd = cmd
         if cmd != '':
             fullCmd = "," + fullCmd
@@ -958,7 +959,7 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
                 lambda: self.callTimeout() )
 
     def callTimeout( self ):
-        log.err( self.factory.host + " timeout" )
+        logging.error( self.factory.host + " timeout" )
         self.transport.loseConnection()
 
     def queueCmd( self, cmd, cb = None ):
@@ -969,31 +970,16 @@ class ControllerProtocol( StatefulTelnetProtocol, object ):
             self.sendCmd( cmd )
 
 class UARTProtocol( StatefulTelnetProtocol ):
-    def connectionMade( self ):
-        self.factory.controller.UARTsend( 0 )
-        log.err( self.factory.controller.host + ' UART connection made' )
 
-
-class UARTConnection( ClientFactory ):
-    maxDelay = 15
-
-    def __init__( self, controller ):
-        self.controller = controller
-
-    def buildProtocol( self, addr ):
-        self.protocol = UARTProtocol()
-        self.controller.UARTconnection = self.protocol
-        self.protocol.factory = self
-        return self.protocol
-  
-    def clientConnectionLost(self, connector, reason):
-        log.err( self.controller.host + \
+    def connectionLost( self, reason ):
+        logging.error( self.controller.host + \
                 ' UART connection lost or failed ' + \
                 reason.getErrorMessage() )
         self.controller.UARTconnectionLost()
 
-    def clientConnectionFailed(self, connector, reason):
-        self.clientConnectionLost( connector, reason )
+
+UARTClientCreator = ClientCreator( reactor, UARTProtocol )
+
 
 class Controller( ReconnectingClientFactory ):
     maxDelay = 15
@@ -1086,7 +1072,7 @@ class Controller( ReconnectingClientFactory ):
     def saveLineState( self, line, state ):
         if self.linesStates[ line ] != ( state == '1' ):
             self.linesStates[ line ] = ( state == '1' )
-            log.msg( "line " + str( line ) + ": " + str( state ) )
+            logging.info( "line " + str( line ) + ": " + str( state ) )
             if self.callbacks.get( line ):
                 for callback in self.callbacks[ line ]:
                     callback( self.linesStates[ line ] )
@@ -1112,11 +1098,17 @@ class Controller( ReconnectingClientFactory ):
         controllers[ name ] = self
         reactor.connectTCP( self.host, 2424, self )
 
+    def UARTonProtocol( self, p ):
+        self.UARTconnection = p
+        p.controller = self
+        self.setUARTtimer()
+        self.UARTsend( 0 )
+        logging.error( self.host + ' UART connected' )
+
     def UARTconnect( self ):
         if self.UART:
-            reactor.connectTCP( self.host, 2525, 
-                    UARTConnection( self ) )
-            self.setUARTtimer()
+            uc = UARTClientCreator.connectTCP( self.host, 2525 )
+            uc.addCallback( self.UARTonProtocol )
 
     def UARTsend( self, val ):
         if self.UARTconnection:
@@ -1151,7 +1143,8 @@ class Controller( ReconnectingClientFactory ):
 
     def UARTconnectionLost( self ):
         if self.UARTconnection:
-            self.UARTconnection.factory.stopFactory()
+            self.UARTconnection.transport.loseConnection()
+            self.UARTconnection = None
         if self.UARTtimer and self.UARTtimer.active():
             self.UARTtimer.cancel()
         if self.connected and self.UART:
@@ -1164,15 +1157,13 @@ class Controller( ReconnectingClientFactory ):
         return self.__connected
 
     def setConnected( self, val ):
-        log.err( "Controller " + self.host + \
-                ' connected: ' + str( val ) )
         self.__connected = val
         for device in self.devices:
             device.controllerConnectionChanged( val )
         if not val and self.UARTconnection:
-            self.UARTconnection.factory.stopFactory()
-            log.err( "Controller " + self.host + ' UART disconnected' )
-            self.UARTconnection = None
+            logging.error( "Controller " + self.host + \
+                    ' UART disconnected' )
+            self.UARTconnectionLost()
 
     connected = property( getConnected, setConnected )
 
@@ -1182,7 +1173,7 @@ class Controller( ReconnectingClientFactory ):
         return self.protocol
 
     def startedConnecting(self, connector):
-        log.msg( 'Started to connect ' + 
+        logging.info( 'Started to connect ' + 
                 connector.getDestination().host )
 
 def charge():
@@ -1212,7 +1203,7 @@ def main():
             ( locationsStr, deviceTypesStr ) ), True )
 
     if not devicesParams:
-        log.err( "No devices on this location!" )
+        logging.error( "No devices on this location!" )
         return
 
     pricesData = cursor2dicts(
