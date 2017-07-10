@@ -2,7 +2,6 @@
 #coding=utf-8
 from twisted.internet import reactor, protocol, task
 from twisted.internet.protocol import ClientFactory, ReconnectingClientFactory, ClientCreator
-from twisted.conch.telnet import StatefulTelnetProtocol
 from twisted.python import log
 from twisted.spread import pb
 from twisted.web import static, server
@@ -252,15 +251,23 @@ class PbConnection( pb.Referenceable ):
         self.update( { 'lpHints' : \
             cursor2dicts( db.execute( sql, (pattern, ) ) ) } )
 
+    def onClientError( self, e ):
+        if not self.clientError:
+            self.clientError = True
+            logging.error( 'Client update error. LocationId: ' \
+                    + str( self.locationId ) )
+            logging.error( str( e ) )
+        if self in clientConnections[ self.locationId ]:
+            clientConnections[ self.locationId ].remove( self )
+
 
     def update( self, params ):
         try:
             self.clientSide.callRemote( "update", 
-                json.dumps( params, default = jsonEncodeExtra ) )
+                json.dumps( params, default = jsonEncodeExtra ) \
+                    ).addErrback( self.onClientError )
         except (pb.PBConnectionLost, pb.DeadReferenceError), e:
-            logging.info( type( e ).__name__ )
-            logging.error( "the client disconnected or crashed" )
-            clientConnections[ self.locationId ].remove( self )
+            self.onClientError(  e )
             return
         if args['t']:
             f = open( conf.get( 'common', 'siteRoot' ) + \
@@ -277,6 +284,7 @@ class PbServer( pb.Root ):
         pbc.clientSide = clientSide
         pbc.locationId = locationId
         pbc.count = 0
+        pbc.clientError = False
         if not clientConnections.has_key( locationId ):
             clientConnections[ locationId ] = []
         clientConnections[ locationId ].append( pbc )
@@ -571,7 +579,8 @@ class Service:
     def start( self ):
         if not self.active:
             self.active = True
-            logging.info( self.device.name + " " + self.name + " start" )
+            logging.info( self.device.name + " " + \
+                    self.name + " start" )
             if self.default:
                 if self.device.pause:
                     self.device.pause = False
@@ -585,12 +594,13 @@ class Service:
     def stop( self ):
         if self.active:
             self.active = False
-            logging.info( self.device.name + " " + self.name + " stop" )
+            logging.info( self.device.name + " " + \
+                    self.name + " stop" )
             if self.default:
-                if self.device.stopping:
-                    self.device.stop()
-                else:
-                    self.device.pause = True
+                #if self.device.stopping:
+                self.device.stop()
+                #else:
+                #    self.device.pause = True
             self.updateClient( active = False )
 
     def charge( self ):

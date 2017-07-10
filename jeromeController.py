@@ -228,14 +228,21 @@ class Controller( ReconnectingClientFactory ):
 
     def UARTsend( self, val ):
         if self.UARTconnection:
+            v0 = val
             data = [40, 41, 42]
             co = 0
             while val > 1000:
                 val -= 1000
-            while val:
-                data[ co ] = ( ( val % 10 ) << 2 ) | co
-                co += 1
-                val /= 10
+            try:
+                while val:
+                    data[ co ] = ( ( val % 10 ) << 2 ) | co
+                    co += 1
+                    val /= 10
+            except IndexError, e:
+                logging.error( "IndexError: value - " + str(v0) + \
+                        " co - " + str( co ) )
+                return
+
 
             self.UARTcache = data
 
