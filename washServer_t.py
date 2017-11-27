@@ -79,7 +79,7 @@ class Car:
             region = queryMatch.group( 2 )
         else:
             ln = query
-            region = None
+            region = ''
         return cls( { 'license_no': ln, 'region': region } )
 
     def __init__( self, params ):
