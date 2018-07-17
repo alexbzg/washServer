@@ -13,7 +13,7 @@ from lxml import etree
 from collections import deque
 
 from common import appRoot, readConf
-from washDB import db, cursor2dicts
+from washDB_t import dbConn, cursor2dicts
 import simplejson as json
 from datetime import date, timedelta
 from jeromeController import Controller, ControllerProtocol
@@ -32,6 +32,8 @@ logging.basicConfig( level = logging.DEBUG
         format='%(asctime)s %(message)s', 
         datefmt='%Y-%m-%d %H:%M:%S' )
 logging.info( 'starting in test mode' )
+
+db = dbConn( conf )
 
 ControllerProtocol.timeoutInterval = \
     conf.getfloat( 'control', 'controllerTimeout' )
@@ -176,7 +178,8 @@ class PbConnection( pb.Referenceable ):
                 'service_mode': od['carData']['serviceMode'],
                 'no_lp': od['carData']['noLP'],
                 'total': od['total'],
-                'pay_sum': od['pay'] }, 
+                'pay_sum': od['pay'], 
+                'card': od['card'] }, 
                 True )
 
 
@@ -184,7 +187,8 @@ class PbConnection( pb.Referenceable ):
             op = operations[ d['closeOperation']['id'] ]
             total = op.getTotal()
             op.close( total, 
-                total if d['closeOperation']['pay'] else 0 )
+                total if d['closeOperation']['pay'] else 0,
+                d['closeOperation']['card'] )
             if ( d['closeOperation']['pay'] and op.car and \
                     op.car.notpayed ):
                 for np in op.car.notpayed.values():
@@ -216,29 +220,33 @@ class PbConnection( pb.Referenceable ):
 
     def sendShiftData( self ):
         sql = """
-            select tstamp_start, operator_id, 
-                totals[1] as qty, totals[3] as total, 
-                totals[2] - totals[3] as notpayed
+            select tstamp_start, operator_id,
+                totals[1] as qty, totals[3] as total,
+                totals[2] - totals[3] as notpayed,
+                totals[4] as total_card,
+                totals[5] as total_cash
             from
-            ( select tstamp_start, operator_id, 
-                ( select ARRAY[ sum( 1 ),                               
-                        sum( round( total, 0 ) ),                  
-                        sum( pay_sum )]
-                    from operations                                 
-                    where location_id = %(location)s
-                      and not service_mode          
-                      and client_id is null                             
+            ( select tstamp_start, operator_id,
+                ( select ARRAY[ sum( 1 ),
+                        sum( round( total, 0 ) ),
+                        sum( pay_sum ),
+                        sum( case when card then 0 else pay_sum end ),
+                        sum( case when not card then 0 else pay_sum end )
+                        ]
+                    from operations
+                    where location_id = 2
+                      and not service_mode
+                      and client_id is null
                       and pay > shifts.tstamp_start ) as totals
               from shifts
-              where location_id = %(location)s and tstamp_end is null   
-              order by tstamp_start desc                       
+              where location_id = 2 and tstamp_end is null
+              order by tstamp_start desc
               limit 1 ) as s
             """
         self.update( { 'shiftData': \
             cursor2dicts( db.execute( sql, 
                 { 'location': self.locationId } ),
                 False ) } )
-
 
     def sendLPHints( self, pattern ):
         sql = """select license_no || region as lp from cars 
@@ -773,8 +781,8 @@ class Operation:
         newKwargs = { 'operations': { self.id: kwargs } }
         updateClient( self.locationId, newKwargs )
 
-    def close( self, total, paySum ):
-        self.update( total = total, pay_sum = paySum )
+    def close( self, total, paySum, card ):
+        self.update( total = total, pay_sum = paySum, card = card )
         del operations[ self.id ]
         self.updateClient( closed = True )
 
